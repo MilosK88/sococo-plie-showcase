@@ -1,23 +1,13 @@
-# backend/api/upload.py
 import io
 import pandas as pd
-from fastapi import APIRouter, UploadFile, File, HTTPException
-import asyncpg
-import os
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from main import get_db
 
 router = APIRouter()
 
-async def get_db_connection():
-    return await asyncpg.connect(
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        database=os.getenv("POSTGRES_DB"),
-        host="127.0.0.1",
-        port=5432
-    )
-
 @router.post("/upload-csv/{tenant_id}")
-async def upload_churn_data(tenant_id: int, file: UploadFile = File(...)):
+async def upload_b2b_leads(tenant_id: int, file: UploadFile = File(...), conn = Depends(get_db)):
+    """Ingests a CSV of B2B SaaS leads, standardizes domains, and queues them for enrichment."""
     if not file.filename.endswith('.csv'):
         raise HTTPException(status_code=400, detail="Only CSV files are accepted.")
     
@@ -25,81 +15,75 @@ async def upload_churn_data(tenant_id: int, file: UploadFile = File(...)):
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents))
         
-        # --- 1. CHURN FILTER ---
-        # We only want inactive members. If 'Aktivan' exists, filter by it.
-        if 'Aktivan' in df.columns:
-            df = df[df['Aktivan'] == False].copy()
+        # --- 1. DATA TRANSFORMATION & MAPPING ---
+        # Standardize column headers to lowercase to survive messy sales exports
+        df.columns = df.columns.str.lower().str.strip()
+        
+        # Map expected B2B CSV columns to our database schema
+        column_mapping = {}
+        
+        # Map Company
+        if 'company name' in df.columns:
+            column_mapping['company name'] = 'company_name'
+        elif 'company' in df.columns:
+            column_mapping['company'] = 'company_name'
             
-        # --- 2. DATA TRANSFORMATION ---
-        
-        # Handle the combined name column
-        if 'Ime i prezime' in df.columns:
-            df['first_name'] = df['Ime i prezime'].fillna('').str.strip()
-        # Fallback just in case you upload the older format again
-        elif 'Ime' in df.columns and 'Prezime' in df.columns:
-            df['first_name'] = df['Ime'].fillna('') + ' ' + df['Prezime'].fillna('')
-            df['first_name'] = df['first_name'].str.strip()
-        
-        # Parse the datetime string from the new column name
-        if 'Zadnji dolazak' in df.columns:
-            df['churn_date'] = pd.to_datetime(df['Zadnji dolazak'], errors='coerce').dt.date
-        elif 'Datum I vreme isteka' in df.columns:
-            df['churn_date'] = pd.to_datetime(df['Datum I vreme isteka'], errors='coerce').dt.date
-
-        # Rename the remaining columns to our DB schema
-        column_mapping = {
-            'Telefon': 'phone_number',
-            'Paket': 'preferred_zone'
-        }
+        # Map Contact Name
+        if 'contact name' in df.columns:
+            column_mapping['contact name'] = 'contact_name'
+        elif 'name' in df.columns:
+            column_mapping['name'] = 'contact_name'
+        elif 'contact' in df.columns:
+            column_mapping['contact'] = 'contact_name'
+            
+        # Map Domain
+        if 'website' in df.columns:
+            column_mapping['website'] = 'domain'
+        elif 'url' in df.columns:
+            column_mapping['url'] = 'domain'
+            
         df.rename(columns=column_mapping, inplace=True)
         
-        # --- 3. VALIDATION LAYER ---
-        required_columns = ['first_name', 'churn_date']
+        # --- 2. VALIDATION LAYER ---
+        required_columns = ['company_name', 'contact_name', 'domain']
         missing_columns = [col for col in required_columns if col not in df.columns]
         
         if missing_columns:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Missing transformed columns: {missing_columns}."
+                detail=f"CSV missing required columns. Expected equivalent of: {required_columns}. Missing: {missing_columns}"
             )
             
-        # Drop rows with empty essential data (no name or no churn date)
-        df.dropna(subset=['first_name', 'churn_date'], inplace=True)
+        # Drop rows missing essential B2B identity data
+        df.dropna(subset=['company_name', 'domain'], inplace=True)
         
-        # --- 4. RECORD COMPILATION ---
+        # --- 3. RECORD COMPILATION ---
         records = []
         for _, row in df.iterrows():
-            # Calculate a basic data completeness score
-            completeness = 0.5
-            if pd.notna(row.get('phone_number')): completeness += 0.25
-            if pd.notna(row.get('preferred_zone')): completeness += 0.25
+            # Clean up domains (e.g., convert 'https://www.sococo.com/pricing' to 'sococo.com')
+            raw_domain = str(row['domain']).strip().lower()
+            clean_domain = raw_domain.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
             
             records.append((
                 tenant_id,
-                row['first_name'],
-                str(row.get('phone_number')) if pd.notna(row.get('phone_number')) else None,
-                row['churn_date'],
-                None, # lifetime_value_eur
-                None, # peak_attendance_time
-                str(row.get('preferred_zone')) if pd.notna(row.get('preferred_zone')) else None,
-                completeness
+                str(row['company_name']).strip(),
+                str(row['contact_name']).strip(),
+                clean_domain
             ))
             
-        # --- 5. DATABASE INSERTION ---
-        conn = await get_db_connection()
-        try:
+        # --- 4. DATABASE INSERTION ---
+        if records:
+            # ON CONFLICT DO NOTHING: Prevents duplicate domain ingestion per tenant.
+            # Safely ignores duplicates without throwing an error.
             await conn.executemany("""
-                INSERT INTO churned_members (
-                    tenant_id, first_name, phone_number, churn_date, 
-                    lifetime_value_eur, peak_attendance_time, preferred_zone, data_completeness
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                INSERT INTO b2b_leads (tenant_id, company_name, contact_name, domain)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (tenant_id, domain) DO NOTHING
             """, records)
-        finally:
-            await conn.close()
             
         return {
             "status": "success", 
-            "message": f"Successfully processed and inserted {len(records)} churned members."
+            "message": f"Successfully processed {len(records)} B2B leads. Duplicates were ignored."
         }
         
     except HTTPException:

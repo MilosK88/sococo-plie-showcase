@@ -1,20 +1,10 @@
-# backend/api/reactivate.py
-import os
+import asyncio
 import datetime
-from fastapi import APIRouter, HTTPException, BackgroundTasks
-import asyncpg
+from fastapi import APIRouter, HTTPException, Depends
+from main import get_db
 from services.llm_engine import generate_reactivation_drafts
 
 router = APIRouter()
-
-async def get_db_connection():
-    return await asyncpg.connect(
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        database=os.getenv("POSTGRES_DB"),
-        host="127.0.0.1",
-        port=5432
-    )
 
 def calculate_cre_score(churn_date, data_completeness):
     """
@@ -46,65 +36,79 @@ def calculate_cre_score(churn_date, data_completeness):
     final_score = max(0, min(100, score))
     return final_score, explanation
 
+async def process_single_lead(member_dict: dict):
+    """Wrapper function to handle scoring and LLM generation for a single lead."""
+    score, explanation = calculate_cre_score(
+        member_dict['churn_date'], 
+        member_dict['data_completeness']
+    )
+    
+    drafts = await generate_reactivation_drafts(member_dict)
+    
+    if drafts:
+        return {
+            "id": member_dict['id'],
+            "score": score,
+            "explanation": explanation,
+            "drafts": drafts
+        }
+    return None
+
 @router.post("/generate-batch/{tenant_id}")
-async def generate_drafts_batch(tenant_id: int, batch_size: int = 10):
+async def generate_drafts_batch(tenant_id: int, batch_size: int = 10, conn = Depends(get_db)):
     """
-    Pulls a batch of unprocessed members, generates their drafts via OpenAI,
-    and updates the database.
+    Pulls a batch of unprocessed leads, generates drafts in PARALLEL via OpenAI,
+    and bulk updates the database in a single transaction.
     """
-    conn = await get_db_connection()
     try:
         # Fetch members who do NOT have a draft yet
         members = await conn.fetch("""
-            SELECT id, first_name, churn_date, preferred_zone, data_completeness 
-            FROM churned_members 
+            SELECT id, contact_name as first_name, company_name, domain, headcount_current, headcount_growth_pct 
+            FROM b2b_leads 
             WHERE tenant_id = $1 AND message_draft_a IS NULL
             LIMIT $2
         """, tenant_id, batch_size)
 
         if not members:
-            return {"status": "complete", "message": "No unprocessed members left in queue."}
+            return {"status": "complete", "message": "No unprocessed leads left in queue."}
 
-        processed_count = 0
-        
-        for record in members:
-            member_dict = dict(record)
-            
-            # 1. Calculate Score
-            score, explanation = calculate_cre_score(
-                member_dict['churn_date'], 
-                member_dict['data_completeness']
-            )
-            
-            # 2. Call OpenAI (Strict Ekavica constraints applied in service layer)
-            drafts = await generate_reactivation_drafts(member_dict)
-            
-            if drafts:
-                # 3. Update the database with the AI drafts and calculated score
-                await conn.execute("""
-                    UPDATE churned_members 
-                    SET cre_score = $1, 
-                        score_explanation = $2,
-                        message_draft_a = $3,
-                        message_draft_b = $4,
-                        message_draft_c = $5
-                    WHERE id = $6
-                """, 
-                score, 
-                explanation, 
-                drafts['message_draft_a'], 
-                drafts['message_draft_b'], 
-                drafts['message_draft_c'], 
-                record['id'])
-                
-                processed_count += 1
+        # 1. Fire all LLM tasks simultaneously (Parallel Execution)
+        tasks = [process_single_lead(dict(record)) for record in members]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 2. Filter out failures and format for bulk DB update
+        successful_updates = []
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Parallel processing error: {str(result)}")
+                continue
+            if result:
+                successful_updates.append((
+                    result['score'],
+                    result['explanation'],
+                    result['drafts']['message_draft_a'],
+                    result['drafts']['message_draft_b'],
+                    result['drafts']['message_draft_c'],
+                    result['id']
+                ))
+
+        # 3. Bulk update the database in one highly-efficient transaction
+        if successful_updates:
+            await conn.executemany("""
+                UPDATE b2b_leads 
+                SET plie_score = $1, 
+                    score_explanation = $2,
+                    message_draft_a = $3,
+                    message_draft_b = $4,
+                    message_draft_c = $5,
+                    enrichment_status = 'complete'
+                WHERE id = $6
+            """, successful_updates)
                 
         return {
             "status": "success", 
-            "message": f"Successfully scored and generated drafts for {processed_count} members."
+            "message": f"Successfully processed {len(successful_updates)} leads in parallel."
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Batch processing failed: {str(e)}")
-    finally:
-        await conn.close()

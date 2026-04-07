@@ -1,6 +1,6 @@
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 import asyncpg
 from dotenv import load_dotenv
 
@@ -23,9 +23,13 @@ async def lifespan(app: FastAPI):
             user=os.getenv("POSTGRES_USER"),
             password=os.getenv("POSTGRES_PASSWORD"),
             database=os.getenv("POSTGRES_DB"),
-            host="127.0.0.1",
-            port=5432
+            host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
+            port=os.getenv("POSTGRES_PORT", "5432"),
+            min_size=1,
+            max_size=10
         )
+        # Attach the pool to the app state so it can be accessed globally
+        app.state.db_pool = db_pool
         print("Database connection pool established.")
         yield
     except Exception as e:
@@ -38,11 +42,16 @@ async def lifespan(app: FastAPI):
             print("Database connection pool closed.")
 
 # Initialize the FastAPI application
-app = FastAPI(title="LuKul CRE Engine", lifespan=lifespan)
+app = FastAPI(title="Sococo PLIE Engine", lifespan=lifespan)
+
+# Dependency function to inject DB connections into routes
+async def get_db(request: Request):
+    async with request.app.state.db_pool.acquire() as connection:
+        yield connection
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "CRE Engine API"}
+    return {"status": "ok", "service": "PLIE Engine API"}
 
 @app.get("/health/db")
 async def db_health():
