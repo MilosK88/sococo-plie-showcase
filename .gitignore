@@ -1,14 +1,17 @@
 # Environments
 .env
-backend/.venv/
 .venv/
 env/
 venv/
+ENV/
 
-# Python caching
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Docker Data Volumes
+postgres_data/
 
 # OS generated files
 .DS_Store

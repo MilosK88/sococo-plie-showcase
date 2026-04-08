@@ -1,12 +1,13 @@
 import asyncio
 import asyncpg
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
+# Bulletproof: Automatically finds the .env file wherever it is
+load_dotenv(find_dotenv())
 
 async def init_db():
+# ... (leave the rest of your file exactly as it is)
     print("Connecting to the database to initialize B2B schema...")
     try:
         conn = await asyncpg.connect(

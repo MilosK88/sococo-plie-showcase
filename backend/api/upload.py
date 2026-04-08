@@ -1,7 +1,7 @@
 import io
 import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from main import get_db
+from database import get_db
 
 router = APIRouter()
 

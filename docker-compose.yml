@@ -3,32 +3,34 @@ version: "3.8"
 services:
   db:
     image: postgres:16-alpine
-    container_name: cre_postgres
+    container_name: sococo_postgres
     restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      # We hardcode these here to override any .env confusion during setup
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: sococo_secure
+      POSTGRES_DB: sococo_db
     ports:
-      - "5432:5432"
+      # Change local port to 5433 to avoid Windows 5432 conflicts
+      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - sococo_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sococo_db"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: cre_redis
+    container_name: sococo_redis
     restart: always
     ports:
-      - "6379:6379"
+      - "6380:6379" # Maps local 6380 to container 6379
     volumes:
-      - redis_data:/data
+      - sococo_redis_data:/data
     command: redis-server --save 60 1 --loglevel warning
 
 volumes:
-  postgres_data:
-  redis_data:
+  sococo_postgres_data:
+  sococo_redis_data:
