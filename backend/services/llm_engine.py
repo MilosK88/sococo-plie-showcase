@@ -1,8 +1,8 @@
 import os
 import logging
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError, APIConnectionError
 from pydantic import BaseModel
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 # Replace raw print statements with structured logging
 logger = logging.getLogger(__name__)
@@ -15,8 +15,24 @@ class DraftVariants(BaseModel):
     variant_b: str
     variant_c: str
 
-# Exponential backoff: Retry up to 3 times, waiting 2, 4, then 8 seconds between attempts.
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def is_retryable(ex: BaseException) -> bool:
+    """
+    Tenacity predicate: only retry on transient network/rate-limit errors.
+    Hard failures (401 AuthenticationError, 400 BadRequestError, etc.) are
+    not retryable — re-raising them immediately saves up to 14 wasted seconds
+    of exponential backoff on a call that will never succeed.
+    """
+    return isinstance(ex, (RateLimitError, APIConnectionError))
+
+
+# Exponential backoff: up to 3 attempts, waiting 2→4→8 seconds between retries.
+# retry= guard ensures only transient errors trigger a retry cycle.
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception(is_retryable),
+    reraise=True,
+)
 async def generate_reactivation_drafts(lead: dict) -> dict:
     """
     Ingests a B2B SaaS lead's telemetry and generates 3 high-converting, 
@@ -51,26 +67,20 @@ async def generate_reactivation_drafts(lead: dict) -> dict:
         }
         """
 
-    try:
-        completion = await client.beta.chat.completions.parse(
-            model="gpt-4o-2024-08-06", 
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Generate outreach for this lead:\n{telemetry}"}
-            ],
-            response_format=DraftVariants,
-            temperature=0.6 # Slightly lowered temperature for sharper, less "creative/fluffy" copy
-        )
+    completion = await client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Generate outreach for this lead:\n{telemetry}"}
+        ],
+        response_format=DraftVariants,
+        temperature=0.6,  # Lower temperature for sharper, less "creative/fluffy" copy
+    )
 
-        drafts = completion.choices[0].message.parsed
-        
-        return {
-            "message_draft_a": drafts.variant_a,
-            "message_draft_b": drafts.variant_b,
-            "message_draft_c": drafts.variant_c
-        }
+    drafts = completion.choices[0].message.parsed
 
-    except Exception as e:
-        logger.error(f"OpenAI Generation Failed for {lead.get('first_name', 'Unknown')}: {e}")
-        # Let tenacity catch the exception and retry. If it exhausts all retries, return None.
-        raise e
+    return {
+        "message_draft_a": drafts.variant_a,
+        "message_draft_b": drafts.variant_b,
+        "message_draft_c": drafts.variant_c,
+    }
