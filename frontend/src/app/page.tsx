@@ -1,64 +1,105 @@
-import Image from "next/image";
+"use client";
+
+import { useState } from "react";
+import Header from "@/components/Header";
+import HeroSection from "@/components/HeroSection";
+import TelemetryPanel from "@/components/TelemetryPanel";
+import BatchSummaryBar from "@/components/BatchSummaryBar";
+import LeadResultsGrid from "@/components/LeadResultsGrid";
+import ErrorState from "@/components/ErrorState";
+import { sampleLeads } from "@/lib/sampleData";
+import { AppState } from "@/lib/types";
+import { triggerBatch, fetchResults, uploadCsv } from "@/lib/api";
 
 export default function Home() {
+  const [appState, setAppState] = useState<AppState>({ phase: "idle" });
+  const [elapsedMsTracker, setElapsedMsTracker] = useState<number>(0);
+
+  const handleExecute = async () => {
+    try {
+      setAppState({ phase: "processing", jobId: "initializing" });
+      
+      // 1. Convert sampleLeads to CSV
+      const runSalt = Math.floor(10000 + Math.random() * 90000);
+      const csvHeader = "company_name,contact_name,domain\n";
+      const csvRows = sampleLeads.map(lead => 
+        `"${lead.company_name}","${lead.contact_name}","${runSalt}.${lead.domain}"`
+      ).join("\n");
+      const csvContent = csvHeader + csvRows;
+      
+      // 2. Create Blob and Upload
+      const blob = new Blob([csvContent], { type: "text/csv" });
+      const file = new File([blob], "leads.csv", { type: "text/csv" });
+      
+      console.log("=== [NEXT.JS] SEEDING DATABASE WITH SAMPLE CSV ===");
+      await uploadCsv(file);
+      
+      // 3. Trigger Batch
+      console.log("=== [NEXT.JS] TRIGGERING BATCH ENRICHMENT ===");
+      const response = await triggerBatch();
+      setAppState({ phase: "processing", jobId: response.job_id });
+    } catch (error: any) {
+      setAppState({ phase: "failed", error: error.message || "An error occurred" });
+    }
+  };
+
+  const handleJobComplete = async (finalMs: number) => {
+    console.log("[PAGE] Job Complete caught. Fetching results...");
+    setElapsedMsTracker(finalMs);
+    try {
+      const results = await fetchResults();
+      if (!results || results.length === 0) {
+        setAppState({ phase: "empty_batch" });
+      } else {
+        setAppState({ phase: "complete", leads: results });
+      }
+    } catch (error: any) {
+      console.error("[PAGE] Failed to fetch results:", error);
+      setAppState({ phase: "failed", error: error.message || "Failed to fetch results" });
+    }
+  };
+
+  const handleJobFail = (errorStr: string) => {
+    setAppState({ phase: "failed", error: errorStr });
+  };
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
+    <div className="min-h-screen bg-[var(--color-alabaster)] font-sans flex flex-col">
+      <Header />
+      
+      <main className="w-full flex-grow">
+        {appState.phase === "idle" && (
+          <HeroSection leads={sampleLeads} onExecute={handleExecute} />
+        )}
+        
+        {appState.phase === "processing" && (
+          <div className="w-full flex-col flex items-center pt-8 px-4 sm:px-8">
+            <TelemetryPanel 
+              jobId={appState.jobId} 
+              onComplete={handleJobComplete}
+              onFail={handleJobFail}
             />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
+          </div>
+        )}
+
+        {appState.phase === "complete" && (
+          <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-500 ease-out pb-16 pt-8">
+            <BatchSummaryBar leads={appState.leads} elapsedMs={elapsedMsTracker} />
+            <LeadResultsGrid leads={appState.leads} />
+          </div>
+        )}
+
+        {appState.phase === "failed" && (
+          <div className="w-full px-4 pt-16">
+            <ErrorState error={appState.error} />
+          </div>
+        )}
+
+        {appState.phase === "empty_batch" && (
+          <div className="w-full text-center pt-32 text-xl font-bold text-[var(--color-deep-slate)]">
+            Batch processing resulted in zero processed leads.
+          </div>
+        )}
       </main>
     </div>
   );

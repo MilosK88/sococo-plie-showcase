@@ -1,4 +1,6 @@
 import asyncio
+import random
+import re
 import uuid
 import logging
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
@@ -55,12 +57,18 @@ def calculate_plie_score(apollo_data, crunchbase_data, bombora_data):
 
 async def process_single_lead(lead_dict: dict, job_id: str):
     """Orchestrates parallel enrichment, scoring, and LLM generation for ONE lead."""
+    # UX Theater: Simulate real-world external API latency (Apollo, Crunchbase, etc.)
+    await asyncio.sleep(random.uniform(1.0, 7.0))
+    
     domain = lead_dict['domain']
     
+    # UX Theater Safety Catch: Sanitize the salt from the domain before hitting mock APIs
+    clean_domain = re.sub(r'^\d{5}\.', '', domain)
+    
     # 1. Fire all 3 Enrichment APIs in PARALLEL for this specific lead
-    apollo_task = apollo_client.get_company_data(domain)
-    crunchbase_task = crunchbase_client.get_funding_data(domain)
-    bombora_task = bombora_client.get_intent_data(domain)
+    apollo_task = apollo_client.get_company_data(clean_domain)
+    crunchbase_task = crunchbase_client.get_funding_data(clean_domain)
+    bombora_task = bombora_client.get_intent_data(clean_domain)
     
     apollo_data, crunchbase_data, bombora_data = await asyncio.gather(
         apollo_task, crunchbase_task, bombora_task, return_exceptions=True
