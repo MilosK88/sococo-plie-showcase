@@ -1,9 +1,14 @@
 import asyncio
+import random
+import re
 import uuid
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
-from database import get_db, get_direct_connection
+import logging
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks, Request
+from dependencies import get_db
 from services.llm_engine import generate_reactivation_drafts
 from services.redis_client import redis_db
+
+logger = logging.getLogger(__name__)
 
 # Import our new Mock Enrichment Clients
 from services.enrichment.apollo import ApolloMockClient
@@ -52,12 +57,18 @@ def calculate_plie_score(apollo_data, crunchbase_data, bombora_data):
 
 async def process_single_lead(lead_dict: dict, job_id: str):
     """Orchestrates parallel enrichment, scoring, and LLM generation for ONE lead."""
+    # UX Theater: Simulate real-world external API latency (Apollo, Crunchbase, etc.)
+    await asyncio.sleep(random.uniform(1.0, 7.0))
+    
     domain = lead_dict['domain']
     
+    # UX Theater Safety Catch: Sanitize the salt from the domain before hitting mock APIs
+    clean_domain = re.sub(r'^\d{5}\.', '', domain)
+    
     # 1. Fire all 3 Enrichment APIs in PARALLEL for this specific lead
-    apollo_task = apollo_client.get_company_data(domain)
-    crunchbase_task = crunchbase_client.get_funding_data(domain)
-    bombora_task = bombora_client.get_intent_data(domain)
+    apollo_task = apollo_client.get_company_data(clean_domain)
+    crunchbase_task = crunchbase_client.get_funding_data(clean_domain)
+    bombora_task = bombora_client.get_intent_data(clean_domain)
     
     apollo_data, crunchbase_data, bombora_data = await asyncio.gather(
         apollo_task, crunchbase_task, bombora_task, return_exceptions=True
@@ -98,90 +109,127 @@ async def process_single_lead(lead_dict: dict, job_id: str):
         }
     return None
 
-async def run_batch_background(tenant_id: int, batch_size: int, job_id: str):
-    """The background worker that handles the actual processing and DB writes."""
-    conn = await get_direct_connection()
-    try:
-        # Fetch leads who do NOT have a draft yet
-        members = await conn.fetch("""
-            SELECT id, contact_name as first_name, company_name, domain 
-            FROM b2b_leads 
-            WHERE tenant_id = $1 AND message_draft_a IS NULL
-            LIMIT $2
-        """, tenant_id, batch_size)
+async def run_batch_background(tenant_id: int, batch_size: int, job_id: str, pool):
+    """
+    Background worker. Receives the application connection pool explicitly —
+    it acquires its own connection from the shared pool rather than opening
+    a raw single-connection that bypasses pool limits.
+    """
+    async with pool.acquire() as conn:
+        try:
+            # Fetch leads who do NOT have a draft yet
+            members = await conn.fetch("""
+                SELECT id, contact_name as first_name, company_name, domain 
+                FROM b2b_leads 
+                WHERE tenant_id = $1 AND message_draft_a IS NULL
+                LIMIT $2
+            """, tenant_id, batch_size)
 
-        if not members:
-            await redis_db.hset(f"job:{job_id}", mapping={"status": "complete", "total": 0, "completed": 0})
-            return
+            if not members:
+                await redis_db.hset(f"job:{job_id}", mapping={"status": "complete", "total": 0, "completed": 0})
+                # Fix #3: Set TTL even on the empty-batch fast-exit path
+                await redis_db.expire(f"job:{job_id}", 86400)
+                return
 
-        # Initialize the job in Redis
-        await redis_db.hset(f"job:{job_id}", mapping={
-            "status": "processing", 
-            "total": len(members), 
-            "completed": 0
-        })
+            # Initialize the job in Redis
+            await redis_db.hset(f"job:{job_id}", mapping={
+                "status": "processing", 
+                "total": len(members), 
+                "completed": 0
+            })
 
-        # 1. Fire ALL Lead Tasks simultaneously (Nested Parallel Execution)
-        tasks = [process_single_lead(dict(record), job_id) for record in members]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 1. Fire ALL Lead Tasks simultaneously (Nested Parallel Execution)
+            tasks = [process_single_lead(dict(record), job_id) for record in members]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 2. Filter out failures and format for bulk DB update
-        successful_updates = []
-        for result in results:
-            if isinstance(result, Exception):
-                print(f"Parallel processing error: {str(result)}")
-                continue
-            if result:
-                successful_updates.append((
-                    result['score'],
-                    result['explanation'],
-                    result['headcount'],
-                    result['growth'],
-                    result['funding'],
-                    result['intent'],
-                    result['drafts']['message_draft_a'],
-                    result['drafts']['message_draft_b'],
-                    result['drafts']['message_draft_c'],
-                    result['id']
-                ))
+            # 2. Filter out failures and format for bulk DB update
+            successful_updates = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("Parallel processing error for job %s: %s", job_id, result)
+                    continue
+                if result:
+                    successful_updates.append((
+                        result['score'],
+                        result['explanation'],
+                        result['headcount'],
+                        result['growth'],
+                        result['funding'],
+                        result['intent'],
+                        result['drafts']['message_draft_a'],
+                        result['drafts']['message_draft_b'],
+                        result['drafts']['message_draft_c'],
+                        result['id']
+                    ))
 
-        # 3. Bulk update the database in one highly-efficient transaction
-        if successful_updates:
-            await conn.executemany("""
-                UPDATE b2b_leads 
-                SET plie_score = $1, 
-                    score_explanation = $2,
-                    headcount_current = $3,
-                    headcount_growth_pct = $4,
-                    funding_stage = $5,
-                    intent_score = $6,
-                    message_draft_a = $7,
-                    message_draft_b = $8,
-                    message_draft_c = $9,
-                    enrichment_status = 'complete'
-                WHERE id = $10
-            """, successful_updates)
-            
-        # Mark the job as completely finished
-        await redis_db.hset(f"job:{job_id}", "status", "complete")
+            # 3. Bulk update the database — Fix #2: wrapped in an explicit
+            # transaction so that a mid-write connection loss cannot leave the
+            # batch in a partial state. All rows commit together or not at all.
+            if successful_updates:
+                async with conn.transaction():
+                    await conn.executemany("""
+                        UPDATE b2b_leads 
+                        SET plie_score = $1, 
+                            score_explanation = $2,
+                            headcount_current = $3,
+                            headcount_growth_pct = $4,
+                            funding_stage = $5,
+                            intent_score = $6,
+                            message_draft_a = $7,
+                            message_draft_b = $8,
+                            message_draft_c = $9,
+                            enrichment_status = 'complete'
+                        WHERE id = $10
+                    """, successful_updates)
 
-    except Exception as e:
-        print(f"Background worker failed: {e}")
-        await redis_db.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
-    finally:
-        await conn.close()
+            # Mark the job as completely finished
+            await redis_db.hset(f"job:{job_id}", "status", "complete")
+            # Fix #3: Set a 24-hour TTL so completed job keys don't accumulate
+            # in Redis memory indefinitely.
+            await redis_db.expire(f"job:{job_id}", 86400)
+
+        except Exception as e:
+            logger.error("Background worker failed for job %s: %s", job_id, e)
+            await redis_db.hset(f"job:{job_id}", mapping={"status": "failed", "error": str(e)})
+            # Fix #3: TTL on the failure state too — failed jobs should not live
+            # in Redis forever either.
+            await redis_db.expire(f"job:{job_id}", 86400)
+        # NOTE: No explicit conn.close() — pool.acquire() context manager returns
+        # the connection to the pool automatically on exit.
+
 
 @router.post("/generate-batch/{tenant_id}")
-async def trigger_batch_generation(tenant_id: int, background_tasks: BackgroundTasks, batch_size: int = 10):
+async def trigger_batch_generation(
+    tenant_id: int,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    batch_size: int = 10
+):
     """Instantly returns a Job ID while processing the batch in the background."""
+    # Fix #4: Per-tenant idempotency lock using SET NX EX.
+    # SET NX ("set if not exists") is atomic in Redis — only one caller wins.
+    # TTL of 60 seconds auto-releases the lock if the worker crashes before
+    # run_batch_background can start, preventing a permanently stuck tenant.
+    lock_key = f"batch_lock:{tenant_id}"
+    lock_acquired = await redis_db.set(lock_key, "1", nx=True, ex=60)
+
+    if not lock_acquired:
+        raise HTTPException(
+            status_code=409,
+            detail="Batch generation already in progress for this tenant. "
+                   "Please wait for the current job to complete before submitting a new one."
+        )
+
     job_id = str(uuid.uuid4())
-    
+
     # Pre-register the job as queued
     await redis_db.hset(f"job:{job_id}", mapping={"status": "queued", "total": batch_size, "completed": 0})
-    
-    # Hand the heavy lifting off to the background thread
-    background_tasks.add_task(run_batch_background, tenant_id, batch_size, job_id)
-    
+
+    # Pass the pool from app.state explicitly — the background task runs outside
+    # the request context and cannot use the get_db dependency directly.
+    pool = request.app.state.db_pool
+    background_tasks.add_task(run_batch_background, tenant_id, batch_size, job_id, pool)
+
     return {
         "status": "accepted",
         "job_id": job_id,
