@@ -2,6 +2,8 @@
 
 An asynchronous, parallel-processing AI orchestration engine designed to autonomously enrich B2B domains, calculate firmographic ICP scores, and generate highly targeted, Challenger-style outbound sales copy.
 
+> 🏢 **Core Systems:** Architected by the engineering team at [LuKul Atelier](https://lukulatelier.com/). The asynchronous parallel processing patterns demonstrated here also power the complex biometric orchestration behind platforms like [IronSilk](https://ironsilk.app/).
+
 ## Architectural Highlights
 
 - **Parallel API Orchestration:** Utilizes `asyncio.gather()` to hit multiple mock enrichment endpoints (Apollo, Crunchbase, Bombora) and OpenAI simultaneously, reducing lead processing latency by 80%.
